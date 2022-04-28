@@ -1,4 +1,3 @@
-import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileNotFoundException;
 import java.io.IOException;
@@ -7,11 +6,10 @@ import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.net.SocketException;
 import java.net.UnknownHostException;
-import java.util.ArrayList;
-import java.util.Scanner;
 import java.util.Timer;
 import java.util.TimerTask;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicIntegerArray;
 
 public class Sender {
   protected final int MAX_RETRANS = 16;
@@ -26,6 +24,7 @@ public class Sender {
   private int seqNum;
   private int ackNum;
   private ConcurrentLinkedQueue<Retransmit> buffer;
+  private AtomicIntegerArray stats;
 
   public Sender(int sourcePort, String destIP, int destPort, String fileName, int mtu, int sws) {
     this.MAX_PKT = mtu - 54;
@@ -35,6 +34,7 @@ public class Sender {
     this.timeout = 5000;
     this.seqNum = 0;
     this.buffer = new ConcurrentLinkedQueue<>();
+    this.stats = new AtomicIntegerArray(6);
 
     try
     {
@@ -101,6 +101,7 @@ public class Sender {
         Retransmit retrans = new Retransmit(tcp);
         new Timer().schedule(retrans, 0, (long)timeout);
         buffer.offer(retrans);
+        stats.addAndGet(0, numBytes);
         seqNum += numBytes;
       }
     }
@@ -129,16 +130,19 @@ public class Sender {
       TCP tcpRec = new TCP();
       tcpRec = tcpRec.deserialize(packet);
 
-      int checksum = tcpRec.getChecksum();
-      if (tcpRec.getFlags() == (TCP.FLAG_ACK | TCP.FLAG_SYN) && tcpRec.getAcknowledge() == seqNum
-          && checksum == tcpRec.computeChecksum())
+      if (tcpRec.getChecksum() == tcpRec.computeChecksum())
       {
-        retrans.cancel();
-        ackNum = tcpRec.getSequence() + 1;
-        timeout = 2 * (System.nanoTime() - tcpRec.getTimeStamp()) / 1000000.0;
-        System.out.println("rcv " + tcpRec);
-        break;
+        if (tcpRec.getFlags() == (TCP.FLAG_ACK | TCP.FLAG_SYN) && tcpRec.getAcknowledge() == seqNum)
+        {
+          retrans.cancel();
+          ackNum = tcpRec.getSequence() + 1;
+          timeout = 2 * (System.nanoTime() - tcpRec.getTimeStamp()) / 1_000_000.0;
+          System.out.println("rcv " + tcpRec);
+          break;
+        }
       }
+      else
+        stats.incrementAndGet(3);
     }
 
     // Send ACK
@@ -146,6 +150,7 @@ public class Sender {
     packet = tcpSend.serialize();
     dp = new DatagramPacket(packet, packet.length, destIp, destPort);
     socket.send(dp);
+    stats.incrementAndGet(1);
     System.out.println("snd " + tcpSend);
   }
 
@@ -183,6 +188,11 @@ public class Sender {
         {
           e.printStackTrace();
         }
+
+        stats.incrementAndGet(1);
+        if (numRetrans != 0)
+          stats.incrementAndGet(4);
+
         numRetrans++;
       }
       else
@@ -195,6 +205,16 @@ public class Sender {
     public int getSeq()
     { return tcp.getSequence(); }
 
+  }
+
+  public void printStats()
+  {
+    System.out.println("Data sent: " + stats.get(0) + "bytes");
+    System.out.println("Packets sent: " + stats.get(1));
+    System.out.println("Out of sequence packets discarded: N/A");
+    System.out.println("Incorrect checksum: " + stats.get(3));
+    System.out.println("Retransmissions: " + stats.get(4));
+    System.out.println("Duplicate ACKs: " + stats.get(5));
   }
 
   private class ReceiveThread implements Runnable {
@@ -225,9 +245,11 @@ public class Sender {
         tcp = tcp.deserialize(buf);
 
         // Check checksum
-        int checksum = tcp.getChecksum();
-        if (checksum != tcp.computeChecksum())
+        if (tcp.getChecksum() != tcp.computeChecksum())
+        {
+          stats.incrementAndGet(3);
           continue;
+        }
 
         System.out.println("rcv " + tcp);
 
@@ -236,6 +258,7 @@ public class Sender {
         {
           eRTT = System.nanoTime() - tcp.getTimeStamp();
           timeout = 2 * eRTT / 1_000_000.0;
+
           TCP tcpSend = new TCP(seqNum, ackNum, TCP.FLAG_ACK);
           byte[] packet = tcpSend.serialize();
           DatagramPacket dpSend = new DatagramPacket(packet, packet.length, destIp, destPort);
@@ -246,6 +269,8 @@ public class Sender {
           {
             e.printStackTrace();
           }
+
+          stats.incrementAndGet(1);
           continue;
         }
         else if (tcp.getFlags() == (TCP.FLAG_ACK | TCP.FLAG_FIN)) // Received FIN
@@ -268,6 +293,43 @@ public class Sender {
             e.printStackTrace();
           }
 
+          // TODO: Wait to see if FIN + ACK resent
+          Thread waitThread = new Thread()
+          {
+            public void run()
+            {
+              while (true)
+              {
+                byte[] buf = new byte[TCP.HEADER_SIZE];
+                DatagramPacket dp = new DatagramPacket(buf, buf.length);
+                try
+                {
+                  socket.receive(dp);
+                } catch (IOException e)
+                {
+                  e.printStackTrace();
+                }
+
+                TCP tcp = new TCP(seqNum, ackNum, TCP.FLAG_ACK);
+                buf = tcp.serialize();
+                dp = new DatagramPacket(packet, packet.length, destIp, destPort);
+                try
+                {
+                  socket.send(dp);
+                } catch (IOException e)
+                {
+                  e.printStackTrace();
+                }
+              }
+            }
+          };
+          long startTime = System.nanoTime();
+          while ((System.nanoTime() - startTime) < (timeout * 16 * 1_000_000))
+          {
+          }
+          waitThread.interrupt();
+
+          stats.incrementAndGet(1);
           break;
         }
 
@@ -288,6 +350,7 @@ public class Sender {
             if (buffer.peek().getSeq() != prevAck)
               System.out.println("Fast Retransmit: restransmitted wrong packet");
           }
+          stats.incrementAndGet(5);
         }
         else
         {
@@ -303,6 +366,7 @@ public class Sender {
         timeout = (eRTT + (4 * eDEV)) / 1_000_000.0;
       }
 
+      printStats();
       System.exit(1);
     }
   }

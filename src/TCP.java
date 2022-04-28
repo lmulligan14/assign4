@@ -180,7 +180,7 @@ public class TCP implements Comparable {
     {
         String str = "";
 
-        str += (timeStamp / 1_000_000_000.0) + " ";
+        str += (System.nanoTime() / 1_000_000_000.0) + " ";
         str += ((flags & FLAG_SYN) != 0) ? "S " : "- ";
         str += ((flags & FLAG_ACK) != 0) ? "A " : "- ";
         str += ((flags & FLAG_FIN) != 0) ? "F " : "- ";

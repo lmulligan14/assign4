@@ -1,16 +1,15 @@
 import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
-import java.io.FileWriter;
 import java.io.IOException;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.net.SocketException;
-import java.util.ArrayList;
 import java.util.PriorityQueue;
 import java.util.Timer;
 import java.util.TimerTask;
+import java.util.concurrent.atomic.AtomicIntegerArray;
 
 public class Receiver {
   protected final int MAX_RETRANS = 16;
@@ -25,6 +24,7 @@ public class Receiver {
   private int destPort;
   private int timeout;
   private PriorityQueue<TCP> buffer;
+  private AtomicIntegerArray stats;
 
   public Receiver(int sourcePort, int mtu, int sws, String fileName) {
     this.MAX_PKT = mtu - 54;
@@ -33,6 +33,7 @@ public class Receiver {
     this.seqNum = 0;
     this.timeout = 5000;
     this.buffer = new PriorityQueue<>(BUF_SIZE);
+    this.stats = new AtomicIntegerArray(6);
 
     File file = new File(fileName);
     try
@@ -61,9 +62,11 @@ public class Receiver {
     byte[] buf;
     DatagramPacket dp;
     boolean done = false;
+    boolean added = true;
 
     while (!done)
     {
+      added = true;
       buf = new byte[MAX_PKT + TCP.HEADER_SIZE];
       dp = new DatagramPacket(buf, buf.length);
       socket.receive(dp);
@@ -71,9 +74,12 @@ public class Receiver {
       TCP tcp = new TCP();
       tcp = tcp.deserialize(buf);
 
-      int checksum = tcp.getChecksum();
-      if (checksum != tcp.computeChecksum())
+      if (tcp.getChecksum() != tcp.computeChecksum())
+      {
+        stats.incrementAndGet(3);
         continue;
+      }
+      stats.incrementAndGet(1);
 
       // Do startup if SYN
       if (tcp.getFlags() == TCP.FLAG_SYN)
@@ -93,6 +99,7 @@ public class Receiver {
         }
 
         ackNum += tcp.getLength();
+        stats.addAndGet(0, tcp.getLength());
         fileStream.write(tcp.getPayload());
         System.out.println("rcv " + tcp);
 
@@ -106,6 +113,7 @@ public class Receiver {
             break;
           }
           ackNum += tcp.getLength();
+          stats.addAndGet(0, tcp.getLength());
           fileStream.write(tcp.getPayload());
         }
         if (done)
@@ -114,11 +122,17 @@ public class Receiver {
       else // Out of order packet, store in buffer
       {
         if (!buffer.contains(tcp) && buffer.size() < BUF_SIZE)
+        {
           buffer.add(tcp);
-        System.out.println("rcv " + tcp);
+          added = false;
+          System.out.println("rcv " + tcp);
+        }
+        else
+          stats.incrementAndGet(2);
       }
 
-      if (tcp.getFlags() != (TCP.FLAG_FIN | TCP.FLAG_ACK)) // Don't send ACK if received FIN, send in teardown()
+      if (tcp.getFlags() != (TCP.FLAG_FIN | TCP.FLAG_ACK) && added) // Don't send ACK if received FIN, send in
+                                                                    // teardown()
       {
         tcp = new TCP(seqNum, ackNum, (byte)(TCP.FLAG_ACK));
         tcp.setTimeStamp(time);
@@ -129,7 +143,9 @@ public class Receiver {
       }
     }
 
+    printStats();
     fileStream.close();
+    System.exit(1);
   }
 
   public void startup(DatagramPacket dp) throws IOException
@@ -148,17 +164,34 @@ public class Receiver {
     tcp.setTimeStamp(time);
     packet = tcp.serialize();
     dp = new DatagramPacket(packet, packet.length, destIp, destPort);
-    Timer retransTimer = new Timer();
-    retransTimer.schedule(new Retransmit(dp), 0, timeout);
+    Retransmit retrans = new Retransmit(dp);
+    new Timer().schedule(retrans, 0, timeout);
     seqNum++;
 
     // Wait for ACK
-    packet = new byte[TCP.HEADER_SIZE];
-    dp = new DatagramPacket(packet, packet.length);
-    socket.receive(dp);
-    tcp = new TCP().deserialize(packet);
-    retransTimer.cancel();
-    System.out.println("rcv " + tcp);
+    while (true)
+    {
+      packet = new byte[TCP.HEADER_SIZE + MAX_PKT];
+      dp = new DatagramPacket(packet, packet.length);
+      socket.receive(dp);
+      tcp = new TCP().deserialize(packet);
+      if (tcp.getChecksum() == tcp.computeChecksum())
+      {
+        stats.incrementAndGet(1);
+        if (tcp.getAcknowledge() == seqNum)
+        {
+          retrans.cancel();
+          System.out.println("rcv " + tcp);
+          break;
+        }
+        else if (tcp.getFlags() == TCP.FLAG_SYN)
+        {
+          retrans.setTime(tcp.getTimeStamp());
+        }
+      }
+      else
+        stats.incrementAndGet(3);
+    }
   }
 
   public void teardown(TCP tcp) throws IOException
@@ -172,25 +205,42 @@ public class Receiver {
     tcp.setTimeStamp(time);
     byte[] packet = tcp.serialize();
     DatagramPacket dp = new DatagramPacket(packet, packet.length, destIp, destPort);
-    Timer retransTimer = new Timer();
-    retransTimer.schedule(new Retransmit(dp), 0, timeout);
+    Retransmit retrans = new Retransmit(dp);
+    new Timer().schedule(retrans, 0, timeout);
     seqNum++;
 
     // Wait for ACK
     while (true)
     {
-      packet = new byte[TCP.HEADER_SIZE];
+      packet = new byte[TCP.HEADER_SIZE + MAX_PKT];
       dp = new DatagramPacket(packet, packet.length);
       socket.receive(dp);
       tcp = new TCP().deserialize(packet);
-      int checksum = tcp.getChecksum();
-      if (tcp.getFlags() == TCP.FLAG_ACK && tcp.getAcknowledge() == seqNum && checksum == tcp.computeChecksum())
+      if (tcp.getChecksum() == tcp.computeChecksum())
       {
-        retransTimer.cancel();
-        System.out.println("rcv " + tcp);
-        break;
+        stats.incrementAndGet(1);
+        if (tcp.getFlags() == TCP.FLAG_ACK && tcp.getAcknowledge() == seqNum)
+        {
+          retrans.cancel();
+          System.out.println("rcv " + tcp);
+          break;
+        }
+        else if (tcp.getFlags() == (TCP.FLAG_ACK | TCP.FLAG_FIN))
+          retrans.run();
       }
+      else
+        stats.incrementAndGet(3);
     }
+  }
+
+  public void printStats()
+  {
+    System.out.println("Data received: " + stats.get(0) + "bytes");
+    System.out.println("Packets received: " + stats.get(1));
+    System.out.println("Out of sequence packets discarded: " + stats.get(2));
+    System.out.println("Incorrect checksum: " + stats.get(3));
+    System.out.println("Retransmissions: " + stats.get(4));
+    System.out.println("Duplicate ACKs: N/A");
   }
 
   private class Retransmit extends TimerTask {
@@ -214,6 +264,10 @@ public class Receiver {
         {
           e.printStackTrace();
         }
+
+        if (numRetrans != 0)
+          stats.incrementAndGet(4);
+
         numRetrans++;
       }
       else
@@ -221,6 +275,14 @@ public class Receiver {
         System.out.println("Error: Number of retransmits exceeded " + MAX_RETRANS);
         System.exit(0);
       }
+    }
+
+    public void setTime(long time)
+    {
+      TCP tcp = new TCP().deserialize(dp.getData());
+      tcp.setTimeStamp(time);
+      byte[] packet = tcp.serialize();
+      dp = new DatagramPacket(packet, packet.length, destIp, destPort);
     }
 
   }
